@@ -1,1 +1,13 @@
-
+(1) alembic upgrade head
+(2) config env file
+  POSTGRES_HOST=127.0.0.1
+  POSTGRES_PORT=5432
+  POSTGRES_USER=root
+  POSTGRES_PASSWORD=pqG_3BB8grND#r
+  POSTGRES_DATABASE=db_name
+  
+  # Remote source database that dev-tools/ingest_local_postgres.py reads from
+  # (schema + rows extracted into the local pgvector store).
+  # CONNECTION_STRINGS=snowflake://user:password@account?warehouse=COMPUTE_WH&database=WIDEWORLDIMPORTERS
+  # CONNECTION_STRINGS=postgresql://user:password@host:5432/dbname
+  CONNECTION_STRINGS=postgresql://root:pqG_3BB8grND%23r@127.0.0.1:5432/db_name
