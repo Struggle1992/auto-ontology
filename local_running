@@ -1,4 +1,4 @@
-(1) alembic upgrade head
+(1) alembic upgrade head  create ontology meta data
 (2) config env file
   POSTGRES_HOST=127.0.0.1
   POSTGRES_PORT=5432
