@@ -11,3 +11,4 @@
   # CONNECTION_STRINGS=snowflake://user:password@account?warehouse=COMPUTE_WH&database=WIDEWORLDIMPORTERS
   # CONNECTION_STRINGS=postgresql://user:password@host:5432/dbname
   CONNECTION_STRINGS=postgresql://root:pqG_3BB8grND%23r@127.0.0.1:5432/db_name
+(3) running auto_ontology/ingestion_service/__main__.py constructing an ontology knowledge graph
