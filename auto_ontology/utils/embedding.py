@@ -2,17 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Text embedding against the configured NIM / inference-api endpoint.
+"""Text embedding against the configured gpuTextToVec endpoint.
 
-Both endpoints speak the OpenAI ``/embeddings`` API, plus three NVIDIA fields
-sent through ``extra_body``. ``input_type`` is the one that matters: NVIDIA's
-embedding models are asymmetric, so a stored row must be embedded as a
-``passage`` and a search string as a ``query``. Mixing them up raises no error
--- it just makes every search worse.
-
-Some deployments ignore ``input_type`` (see ``_TEXT_PREFIXED_MODELS``); for
-those the type is written into the text as a ``query: `` / ``passage: ``
-prefix, the instruction the model was trained with.
+The endpoint takes a JSON body ``{"texts": [...], "model_name": "..."}`` and
+authenticates with an ``x-jwt-ms-token`` header, so it does not speak the
+OpenAI ``/embeddings`` API and is called directly over httpx rather than via
+the OpenAI client.
 
 Ingest and query MUST use the same model; a mismatch produces garbage results
 or a dimension error from pgvector.
@@ -30,7 +25,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal
 
 import httpx
-from openai import APIStatusError, Omit, OpenAI
 
 from auto_ontology.utils.model_config import resolve
 from auto_ontology.vdb.records import write_embedded_rows
@@ -44,13 +38,20 @@ logger = logging.getLogger(__name__)
 
 InputType = Literal["passage", "query"]
 
-# Model ids (matched as substrings) whose endpoint drops ``input_type`` and
-# needs the prefix in the text instead. Without it every vector shares one
-# dominant direction and similarity ranking is close to random; models that do
-# honour ``input_type`` get slightly worse with the prefix added on top. Only
-# the inference-api nvfp4 deployment drops it: the hosted
-# ``nvidia/nemotron-3.5-embed-1b`` on build.nvidia.com honours ``input_type``.
-_TEXT_PREFIXED_MODELS = ("nemotron-3.5-embed-1b-nvfp4",)
+# The gpuTextToVec endpoint authenticates with a JWT carried in this header
+# rather than an ``Authorization: Bearer`` scheme, so the key configured as
+# EMBED_API_KEY is sent here, not as a bearer token.
+_AUTH_HEADER = "x-jwt-ms-token"
+
+# HTTP statuses that are transient: the per-request retry loop below retries
+# these before surfacing the failure. Anything else >= 400 is a wrong request
+# (bad key, unknown model, wrong path) and is raised at once as fatal.
+_TRANSIENT_STATUSES = {408, 409, 429, 500, 502, 503, 504}
+
+# Per-request retry backoff: short, because the slow rate-limit recovery is the
+# chunk-level retry's job (see _embed_with_retry). Seconds, doubling, capped.
+_RETRY_BACKOFF_BASE_S = 0.25
+_RETRY_BACKOFF_MAX_S = 4.0
 
 # Each field falls back to DEFAULT_MODELS_<field>.
 _EMBED_ENDPOINT = resolve("EMBED", "ENDPOINT")
@@ -106,53 +107,137 @@ def get_embed_params() -> EmbedParams:
     )
 
 
+class TransientEmbeddingError(RuntimeError):
+    """A transient embedding-endpoint failure (5xx/429/timeout/transport).
+
+    Raised by :func:`_post_embeddings` when its own retry budget is exhausted
+    on a failure waiting cannot rule out, so callers can tell a blip from a
+    wrong request (the latter raises :class:`httpx.HTTPStatusError` for a 4xx)
+    by type rather than by message text.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
 
-# A keyless self-hosted NIM expects no Authorization header, and the client
-# only sends none when the header is omitted per request.
-_NO_AUTH = {"Authorization": Omit()}
-
-_clients: dict[tuple[str, str], OpenAI] = {}
-_clients_lock = threading.Lock()
+# One httpx.Client per endpoint URL, so its connection pool is shared across
+# batches and across embed_texts calls.
+_http_clients: dict[str, httpx.Client] = {}
+_http_clients_lock = threading.Lock()
 
 
-def _base_url(endpoint: str) -> str:
-    """*endpoint* without a trailing ``/embeddings``, which the client appends.
-
-    Configs carry both forms -- the built-in defaults end at ``/v1``, older
-    deployments spell out ``/v1/embeddings`` -- and both have to keep working.
-    """
-    url = endpoint.rstrip("/")
-    return url.removesuffix("/embeddings")
-
-
-def _new_client(params: EmbedParams, http_client: httpx.Client | None = None) -> OpenAI:
-    return OpenAI(
-        base_url=_base_url(params.embed_invoke_url),
-        # The client refuses to start without a key; a keyless endpoint gets a
-        # placeholder here and no header at all, see _NO_AUTH.
-        api_key=params.api_key or "unused",
-        max_retries=_REQUEST_RETRIES,
-        http_client=http_client,
-    )
-
-
-def _client(params: EmbedParams) -> OpenAI:
-    """One client per endpoint and key, so its connection pool is shared."""
-    key = (_base_url(params.embed_invoke_url), params.api_key)
-    with _clients_lock:
-        client = _clients.get(key)
+def _http_client(params: EmbedParams) -> httpx.Client:
+    """A shared httpx.Client keyed by endpoint URL, so connection pools are reused."""
+    url = params.embed_invoke_url
+    with _http_clients_lock:
+        client = _http_clients.get(url)
         if client is None:
-            client = _clients[key] = _new_client(params)
+            client = _http_clients[url] = httpx.Client()
         return client
 
 
-def _text_prefix(model_name: str, input_type: InputType) -> str:
-    if any(model in model_name for model in _TEXT_PREFIXED_MODELS):
-        return f"{input_type}: "
-    return ""
+def _retry_backoff(attempt: int) -> float:
+    return min(_RETRY_BACKOFF_BASE_S * (2**attempt), _RETRY_BACKOFF_MAX_S)
+
+
+def _extract_vectors(payload: object, expected: int) -> list[list[float]]:
+    """Pull the vectors out of the endpoint's JSON response, in input order.
+
+    The gpuTextToVec response envelope is not documented here, so the common
+    shapes are all accepted: a top-level list, or an object under
+    ``embeddings``, ``vectors``, ``result`` or ``data``. ``data`` may itself be
+    a list of vectors or a list of ``{"embedding": [...]}`` objects (the OpenAI
+    shape, kept so a NIM-style endpoint still works if it is wired in later).
+
+    The count must match *expected*: one vector per input text, in order. A
+    short or long response is a loud error rather than silently dropping or
+    duplicating rows.
+    """
+    if isinstance(payload, list):
+        raw = payload
+    elif isinstance(payload, dict):
+        for key in ("embeddings", "vectors", "result", "data"):
+            value = payload.get(key)
+            if value is not None:
+                raw = value
+                break
+        else:
+            raise RuntimeError(
+                "embedding endpoint returned an unrecognised body: "
+                f"{str(payload)[:200]}"
+            )
+    else:
+        raise RuntimeError(
+            f"embedding endpoint returned a non-object body: {str(payload)[:200]}"
+        )
+    vectors: list[list[float]] = []
+    for item in raw:
+        if isinstance(item, dict) and "embedding" in item:
+            vectors.append([float(x) for x in item["embedding"]])
+        elif isinstance(item, (list, tuple)):
+            vectors.append([float(x) for x in item])
+        else:
+            raise RuntimeError(
+                f"embedding endpoint returned a non-vector element: {item!r}"
+            )
+    if len(vectors) != expected:
+        raise RuntimeError(
+            f"embedding endpoint returned {len(vectors)} vector(s) "
+            f"for {expected} input(s)."
+        )
+    return vectors
+
+
+def _post_embeddings(
+    params: EmbedParams,
+    texts: list[str],
+    *,
+    timeout: float,
+    retries: int,
+) -> list[list[float]]:
+    """POST *texts* to the gpuTextToVec endpoint and return one vector each.
+
+    Retries transient failures (408/409/429/5xx and transport errors) up to
+    *retries* times with a short backoff. A non-transient 4xx is raised at once
+    via ``raise_for_status`` so :func:`_is_fatal` can classify it by status.
+    """
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if params.api_key:
+        headers[_AUTH_HEADER] = params.api_key
+    payload = {"texts": list(texts), "model_name": params.model_name}
+    client = _http_client(params)
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            response = client.post(
+                params.embed_invoke_url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(_retry_backoff(attempt))
+                continue
+            break
+        if response.status_code in _TRANSIENT_STATUSES:
+            last_exc = RuntimeError(
+                f"embedding endpoint returned HTTP {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+            if attempt < retries:
+                time.sleep(_retry_backoff(attempt))
+                continue
+            break
+        if response.status_code >= 400:
+            response.raise_for_status()
+        return _extract_vectors(response.json(), len(texts))
+    raise TransientEmbeddingError(
+        f"embedding request to {params.embed_invoke_url} failed after "
+        f"{retries + 1} attempt(s): {last_exc}"
+    )
 
 
 def embed_texts(
@@ -167,7 +252,7 @@ def embed_texts(
 
     Blank texts are not sent and come back as ``None``. Raises the client's
     error when a request fails after its retries -- an
-    :class:`openai.APIStatusError` carries the HTTP status in its message.
+    :class:`httpx.HTTPStatusError` carries the HTTP status in its message.
     *timeout* (seconds per request) and *retries* (per request) default to the
     ingest-sized ``params.request_timeout_s`` and ``_REQUEST_RETRIES``; a caller
     with its own retry loop passes ``retries=0`` so the two do not multiply.
@@ -178,36 +263,20 @@ def embed_texts(
     if not to_send:
         return vectors
 
-    client = _client(params)
-    if retries is not None:
-        client = client.with_options(max_retries=retries)
+    max_retries = _REQUEST_RETRIES if retries is None else retries
     batches = list(itertools.batched(to_send, max(1, params.inference_batch_size)))
-    prefix = _text_prefix(params.model_name, input_type)
+    request_timeout = timeout or params.request_timeout_s
 
     def _embed_batch(indices: tuple[int, ...]) -> None:
-        response = client.embeddings.create(
-            model=params.model_name,
-            input=[prefix + stripped[i] for i in indices],
-            encoding_format="float",
-            extra_body={
-                "input_type": input_type,
-                "truncate": "END",
-                "modality": params.embed_modality,
-            },
-            timeout=timeout or params.request_timeout_s,
-            extra_headers=None if params.api_key else _NO_AUTH,
+        batch_texts = [stripped[i] for i in indices]
+        batch_vectors = _post_embeddings(
+            params,
+            batch_texts,
+            timeout=request_timeout,
+            retries=max_retries,
         )
-        returned = [item.index for item in response.data]
-        if sorted(returned) != list(range(len(indices))):
-            # Exactly one vector per input. A missing one would leave a row
-            # unembedded, and a duplicate would overwrite another row's
-            # vector; either way the caller would persist it without noticing.
-            raise RuntimeError(
-                f"Embedding endpoint returned {len(response.data)} vector(s) "
-                f"for {len(indices)} input(s)."
-            )
-        for item in response.data:
-            vectors[indices[item.index]] = list(item.embedding)
+        for i, vector in zip(indices, batch_vectors):
+            vectors[i] = list(vector)
 
     if len(batches) == 1:
         _embed_batch(batches[0])
@@ -224,15 +293,28 @@ def embed_texts(
 # ---------------------------------------------------------------------------
 
 
+def _http_status(exc: Exception) -> int | None:
+    """The HTTP status carried by *exc*, if any.
+
+    ``httpx.HTTPStatusError`` exposes it on ``.response.status_code``; matched
+    by attribute rather than by import so a driver swap degrades to "not fatal"
+    instead of raising from inside the error path.
+    """
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None)
+
+
 def _is_fatal(exc: Exception) -> bool:
     """Whether *exc* says the request itself is wrong, so waiting cannot help.
 
     Any 4xx except 408 (timeout), 409 and 429 (rate limit): a bad key, an
-    unknown model id, a wrong path. The client has already retried the rest.
+    unknown model id, a wrong path. Transport errors and exhausted transient
+    retries are not fatal -- the chunk-level retry may still recover them.
     """
-    return isinstance(exc, APIStatusError) and (
-        400 <= exc.status_code < 500 and exc.status_code not in (408, 409, 429)
-    )
+    status = _http_status(exc)
+    if status is None:
+        return False
+    return 400 <= status < 500 and status not in (408, 409, 429)
 
 
 def _embed_frame(frame: "pd.DataFrame", params: EmbedParams) -> "pd.DataFrame":
