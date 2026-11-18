@@ -4,9 +4,9 @@
 
 """Tests for :mod:`auto_ontology.utils.embedding`.
 
-The endpoint is replaced by an ``httpx.MockTransport`` under the real OpenAI
+The endpoint is replaced by an ``httpx.MockTransport`` under the real httpx
 client, so what is asserted is the request that actually goes over the wire:
-the NVIDIA fields riding in the body, the auth header, batching, ordering and
+the gpuTextToVec body, the ``x-jwt-ms-token`` header, batching, ordering and
 which failures are retried.
 """
 
@@ -19,7 +19,6 @@ from typing import Any, Callable
 import httpx
 import pandas as pd
 import pytest
-from openai import AuthenticationError, OpenAI, RateLimitError
 
 from auto_ontology.utils import embedding
 from auto_ontology.utils.embedding import (
@@ -37,9 +36,9 @@ Handler = Callable[[httpx.Request], httpx.Response]
 
 def _params(**overrides: Any) -> EmbedParams:
     fields: dict[str, Any] = {
-        "model_name": "nvidia/embed",
-        "embed_invoke_url": "https://embed.example/v1",
-        "api_key": "sk-test",
+        "model_name": "bge-m3",
+        "embed_invoke_url": "https://embed.example/ray/server/gpuTextToVec",
+        "api_key": "jwt-test",
     }
     fields.update(overrides)
     return EmbedParams(**fields)
@@ -50,22 +49,17 @@ def _vector(text: str) -> list[float]:
     return [float(len(text)), float(ord(text[0]))]
 
 
-def _ok(request: httpx.Request, *, reverse: bool = False) -> httpx.Response:
+def _ok(request: httpx.Request) -> httpx.Response:
     body = json.loads(request.content)
-    data = [
-        {"object": "embedding", "index": i, "embedding": _vector(text)}
-        for i, text in enumerate(body["input"])
-    ]
-    if reverse:
-        data.reverse()
-    return httpx.Response(200, json={"object": "list", "data": data, "model": "m"})
+    vectors = [_vector(text) for text in body["texts"]]
+    return httpx.Response(200, json={"embeddings": vectors})
 
 
 @pytest.fixture
 def endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[[Handler], list[httpx.Request]]:
-    """Route the module's client through *handler*; returns the requests seen."""
+    """Route the module's httpx client through *handler*; returns the requests seen."""
 
     def _install(handler: Handler) -> list[httpx.Request]:
         seen: list[httpx.Request] = []
@@ -74,11 +68,10 @@ def endpoint(
             seen.append(request)
             return handler(request)
 
-        def _client(params: EmbedParams) -> OpenAI:
-            transport = httpx.MockTransport(_record)
-            return embedding._new_client(params, httpx.Client(transport=transport))
+        def _http_client(params: EmbedParams) -> httpx.Client:
+            return httpx.Client(transport=httpx.MockTransport(_record))
 
-        monkeypatch.setattr(embedding, "_client", _client)
+        monkeypatch.setattr(embedding, "_http_client", _http_client)
         return seen
 
     return _install
@@ -89,77 +82,31 @@ def endpoint(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("input_type", ["passage", "query"])
-def test_the_request_carries_the_nvidia_fields(endpoint, input_type: str) -> None:
+def test_the_request_carries_the_gputextovec_fields(endpoint) -> None:
     seen = endpoint(_ok)
 
-    vectors = embed_texts(["  orders  "], _params(), input_type)
+    vectors = embed_texts(["  orders  "], _params(), "passage")
 
     assert vectors == [_vector("orders")]
     [request] = seen
-    assert request.url.path == "/v1/embeddings"
-    assert request.headers["authorization"] == "Bearer sk-test"
+    assert request.url.path == "/ray/server/gpuTextToVec"
+    assert request.headers["x-jwt-ms-token"] == "jwt-test"
     assert json.loads(request.content) == {
-        "model": "nvidia/embed",
-        "input": ["orders"],
-        "encoding_format": "float",
-        "input_type": input_type,
-        "truncate": "END",
-        "modality": "text",
+        "texts": ["orders"],
+        "model_name": "bge-m3",
     }
 
 
-@pytest.mark.parametrize("input_type", ["passage", "query"])
-def test_a_model_that_ignores_input_type_gets_it_as_a_text_prefix(
-    endpoint, input_type: str
-) -> None:
+def test_the_configured_url_is_used_verbatim(endpoint) -> None:
     seen = endpoint(_ok)
-
-    embed_texts(
-        ["  orders  "],
-        _params(model_name="nvidia/nvidia/nemotron-3.5-embed-1b-nvfp4"),
-        input_type,
-    )
-
-    body = json.loads(seen[0].content)
-    assert body["input"] == [f"{input_type}: orders"]
-    assert body["input_type"] == input_type
+    embed_texts(["x"], _params(embed_invoke_url="https://host.example/vec"), "passage")
+    assert str(seen[0].url) == "https://host.example/vec"
 
 
-def test_the_hosted_nemotron_3_5_model_gets_input_type_without_a_prefix(
-    endpoint: Callable[[Handler], list[httpx.Request]],
-) -> None:
-    seen = endpoint(_ok)
-
-    embed_texts(
-        ["  orders  "],
-        _params(model_name="nvidia/nemotron-3.5-embed-1b"),
-        "query",
-    )
-
-    body = json.loads(seen[0].content)
-    assert body["input"] == ["orders"]
-    assert body["input_type"] == "query"
-
-
-@pytest.mark.parametrize(
-    "configured",
-    [
-        "https://embed.example/v1",
-        "https://embed.example/v1/",
-        "https://embed.example/v1/embeddings",
-    ],
-)
-def test_both_endpoint_spellings_reach_the_same_url(endpoint, configured: str) -> None:
-    seen = endpoint(_ok)
-    embed_texts(["x"], _params(embed_invoke_url=configured), "passage")
-    assert str(seen[0].url) == "https://embed.example/v1/embeddings"
-
-
-def test_no_key_sends_no_authorization_header(endpoint) -> None:
+def test_no_key_sends_no_auth_header(endpoint) -> None:
     seen = endpoint(_ok)
     embed_texts(["x"], _params(api_key=""), "passage")
-    assert "authorization" not in seen[0].headers
+    assert "x-jwt-ms-token" not in seen[0].headers
 
 
 def test_the_key_stays_out_of_repr() -> None:
@@ -167,40 +114,26 @@ def test_the_key_stays_out_of_repr() -> None:
 
 
 def test_batches_and_reassembles_in_input_order(endpoint) -> None:
-    """Out-of-order ``data`` and concurrent batches still line up with the input."""
-    seen = endpoint(lambda request: _ok(request, reverse=True))
+    """Concurrent batches still line up with the input order."""
+    seen = endpoint(_ok)
     texts = ["a", "bb", "ccc", "dddd", "eeeee"]
 
     vectors = embed_texts(texts, _params(inference_batch_size=2), "passage")
 
     assert vectors == [_vector(t) for t in texts]
-    assert sorted(len(json.loads(r.content)["input"]) for r in seen) == [1, 2, 2]
+    assert sorted(len(json.loads(r.content)["texts"]) for r in seen) == [1, 2, 2]
 
 
-def test_a_short_response_is_an_error_not_a_partial_batch(endpoint) -> None:
-    """Silently leaving the missing rows unembedded would drop them from the store."""
+def test_a_wrong_count_is_an_error_not_a_partial_batch(endpoint) -> None:
+    """Silently leaving rows unembedded would drop them from the store."""
 
     def _short(request: httpx.Request) -> httpx.Response:
-        full = _ok(request)
-        body = full.json()
-        body["data"] = body["data"][:1]
-        return httpx.Response(200, json=body)
+        body = json.loads(request.content)
+        vectors = [_vector(t) for t in body["texts"]][:-1]
+        return httpx.Response(200, json={"embeddings": vectors})
 
     endpoint(_short)
     with pytest.raises(RuntimeError, match="1 vector"):
-        embed_texts(["a", "b"], _params(), "passage")
-
-
-def test_a_duplicated_index_is_an_error(endpoint) -> None:
-    """``[0, 1, 1]`` for two inputs would let one row's vector overwrite another's."""
-
-    def _duplicated(request: httpx.Request) -> httpx.Response:
-        body = _ok(request).json()
-        body["data"].append(dict(body["data"][1]))
-        return httpx.Response(200, json=body)
-
-    endpoint(_duplicated)
-    with pytest.raises(RuntimeError, match="3 vector"):
         embed_texts(["a", "b"], _params(), "passage")
 
 
@@ -210,7 +143,7 @@ def test_blank_texts_are_not_sent(endpoint) -> None:
     vectors = embed_texts(["a", "  ", None, "b"], _params(), "passage")  # type: ignore[list-item]
 
     assert vectors == [_vector("a"), None, None, _vector("b")]
-    assert json.loads(seen[0].content)["input"] == ["a", "b"]
+    assert json.loads(seen[0].content)["texts"] == ["a", "b"]
 
 
 def test_nothing_to_send_makes_no_request(endpoint) -> None:
@@ -233,12 +166,8 @@ def test_a_rate_limit_is_retried_by_the_client(endpoint) -> None:
 
 
 def test_retries_zero_leaves_retrying_to_the_caller(endpoint) -> None:
-    seen = endpoint(
-        lambda request: httpx.Response(
-            429, headers={"retry-after-ms": "1"}, json={"error": "slow"}
-        )
-    )
-    with pytest.raises(RateLimitError):
+    seen = endpoint(lambda request: httpx.Response(429, json={"error": "slow"}))
+    with pytest.raises(RuntimeError):
         embed_texts(["a"], _params(), "query", retries=0)
     assert len(seen) == 1
 
@@ -265,18 +194,16 @@ def test_the_timeout_reaches_the_request(endpoint) -> None:
     ],
 )
 def test_only_a_wrong_request_is_fatal(status: int, fatal: bool) -> None:
-    from openai import APIStatusError
-
-    request = httpx.Request("POST", "https://embed.example/v1/embeddings")
-    exc = APIStatusError(
-        "x", response=httpx.Response(status, request=request), body=None
+    request = httpx.Request("POST", "https://embed.example/ray/server/gpuTextToVec")
+    exc = httpx.HTTPStatusError(
+        "x", request=request, response=httpx.Response(status, request=request)
     )
     assert _is_fatal(exc) is fatal
 
 
 def test_a_bad_key_fails_at_once(endpoint) -> None:
     seen = endpoint(lambda request: httpx.Response(401, json={"error": "bad key"}))
-    with pytest.raises(AuthenticationError):
+    with pytest.raises(httpx.HTTPStatusError):
         embed_texts(["a"], _params(), "passage")
     assert len(seen) == 1
 
@@ -306,7 +233,7 @@ def test_embed_frame_reports_a_failure_instead_of_raising(endpoint) -> None:
     out = _embed_frame(pd.DataFrame(_rows("a")), _params())
 
     assert not any(m.get("embedding") for m in out["metadata"])
-    assert "AuthenticationError" in out.attrs["embed_error"]
+    assert "401" in out.attrs["embed_error"]
     assert out.attrs["embed_error_fatal"] is True
 
 
