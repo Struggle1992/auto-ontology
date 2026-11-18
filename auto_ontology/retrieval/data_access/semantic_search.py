@@ -76,14 +76,22 @@ _EMBED_QUERY_RETRYABLE_TOKENS = (
 
 def _is_retryable(exc: Exception) -> bool:
     """Whether *exc* is an endpoint blip rather than a problem with the query."""
-    from openai import APIConnectionError, APIStatusError
+    import httpx
 
-    # APIConnectionError covers timeouts too, whose message ("Request timed
-    # out.") none of the tokens below would match.
-    if isinstance(exc, APIConnectionError):
+    from auto_ontology.utils.embedding import TransientEmbeddingError
+
+    # _post_embeddings wraps a transient HTTP failure or transport error as
+    # TransientEmbeddingError once its own attempt budget is spent, so this is
+    # the common case on the query path (retries=0).
+    if isinstance(exc, TransientEmbeddingError):
         return True
-    if isinstance(exc, APIStatusError):
-        return exc.status_code in (408, 429) or exc.status_code >= 500
+    # A raw transport error (timeout, dropped connection) that bypassed the
+    # wrapper; its message need not name any status token.
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status in (408, 429) or status >= 500
     return any(tok in str(exc) for tok in _EMBED_QUERY_RETRYABLE_TOKENS)
 
 
