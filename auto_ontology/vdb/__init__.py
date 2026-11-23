@@ -4,6 +4,8 @@
 
 """VDB initialization — data layer and semantic layer collections."""
 
+import os
+
 from auto_ontology.infra.postgres import get_postgres_connection_string
 from auto_ontology.vdb.postgres import PostgresVDB
 
@@ -27,6 +29,9 @@ def get_vdb(
         "connection_string": connection_string,
         "collection_name": collection_name,
         "schema_name": VDB_SCHEMA,
+        # Must match the embedding model's output dimension. bge-m3 emits
+        # 1024; the default NVIDIA model emits 2048.
+        "vector_size": int(os.environ.get("AUTO_ONTOLOGY_VECTOR_SIZE", "2048")),
     }
     if database_name:
         kwargs["database_name"] = database_name
