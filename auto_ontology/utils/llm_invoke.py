@@ -5,6 +5,7 @@
 """LLM client construction and structured-output invocation wrappers."""
 
 import contextlib
+import json
 import logging
 import os
 import random
@@ -225,6 +226,23 @@ def _build_client(
     ``ChatOpenAI``, which supports structured output. Everything else uses
     ``ChatNVIDIA``.
     """
+    # DeepSeek is OpenAI-compatible for chat and JSON mode, but not for the
+    # json_schema structured-output path ChatNVIDIA uses.
+    if "deepseek" in model.lower() or "deepseek" in (base_url or "").lower():
+        from langchain_openai import ChatOpenAI
+
+        deepseek_base_url = (base_url or "").rstrip("/")
+        if deepseek_base_url and not deepseek_base_url.endswith("/v1"):
+            deepseek_base_url += "/v1"
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            base_url=deepseek_base_url,
+            max_tokens=max_tokens,
+            timeout=LLM_INVOKE_TIMEOUT_S,
+            max_retries=0,
+        )
+
     if model.startswith(("openai/", "azure/", "aws/")):
         from langchain_openai import ChatOpenAI
 
@@ -422,6 +440,17 @@ def _is_claude(llm: BaseChatModel) -> bool:
     return "anthropic" in lowered or "claude" in lowered
 
 
+def _is_deepseek(llm: BaseChatModel) -> bool:
+    """True when *llm* targets DeepSeek's OpenAI-compatible API."""
+    model = str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "")
+    base_url = str(
+        getattr(llm, "openai_api_base", "")
+        or getattr(llm, "base_url", "")
+        or ""
+    )
+    return "deepseek" in model.lower() or "deepseek" in base_url.lower()
+
+
 def _system_messages_first(
     llm: BaseChatModel, messages: list[BaseMessage]
 ) -> list[BaseMessage]:
@@ -474,6 +503,11 @@ def _structured_output_kwargs(llm: BaseChatModel) -> dict:
     """
     if _is_claude(llm):
         return {"method": "function_calling", "tool_choice": None}
+    # DeepSeek accepts response_format={"type": "json_object"} but rejects the
+    # json_schema variant ChatNVIDIA sends ("This response_format type is
+    # unavailable now"), and its thinking mode rejects tool_choice.
+    if _is_deepseek(llm):
+        return {"method": "json_mode"}
     return {}
 
 
@@ -562,6 +596,20 @@ def safe_invoke_with_structured_output(
     current_messages = _ensure_non_system_message(messages.copy())
     schema_name = getattr(schema, "__name__", str(schema))
     structured_kwargs = _structured_output_kwargs(llm)
+    if structured_kwargs.get("method") == "json_mode":
+        # json_mode only enables response_format=json_object; it does not tell
+        # the model what shape to emit. Put the schema in a system message so
+        # the model has the field names and types.
+        current_messages = [
+            SystemMessage(
+                content=(
+                    "Return a single JSON object that satisfies this JSON Schema. "
+                    "Do not wrap it in Markdown or add commentary.\n"
+                    + json.dumps(schema.model_json_schema(), ensure_ascii=False)
+                )
+            ),
+            *current_messages,
+        ]
 
     for attempt in range(RETRY_MAX_ATTEMPTS):
         try:
