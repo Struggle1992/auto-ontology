@@ -30,6 +30,32 @@ def _fetch_frame(
     return pd.DataFrame(rows)
 
 
+def _parse_schemas_from_url(connection_string: str) -> tuple[list[str] | None, str]:
+    """Extract and strip a ``?schemas=s1,s2`` query param from a connection URL.
+
+    Returns ``(schemas, clean_url)`` where *clean_url* has the param removed so
+    psycopg/libpq does not reject it as an unknown option. ``None`` when absent.
+    """
+    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
+    parsed = urlparse(connection_string)
+    schemas_raw: str | None = None
+    remaining: list[tuple[str, str]] = []
+    for key, value in parse_qsl(parsed.query):
+        if key == "schemas":
+            schemas_raw = value
+        else:
+            remaining.append((key, value))
+    if not schemas_raw:
+        return None, connection_string
+    schemas = [s.strip() for s in schemas_raw.split(",") if s.strip()]
+    if not schemas:
+        return None, connection_string
+    new_query = urlencode(remaining)
+    clean_url = urlunparse(parsed._replace(query=new_query))
+    return schemas, clean_url
+
+
 class PostgresDatabase(SQLDatabase):
     """Concrete :class:`SQLDatabase` backed by ``psycopg`` (v3).
 
@@ -45,15 +71,20 @@ class PostgresDatabase(SQLDatabase):
 
     supports_statement_timeout = True
 
-    def __init__(self, connection_string: str) -> None:
-        self._connection_string = connection_string
+    def __init__(self, connection_string: str, schemas: list[str] | None = None) -> None:
+        # Parse optional ?schemas=s1,s2 from the URL so env-var
+        # CONNECTION_STRINGS can scope a large multi-schema database without
+        # needing a catalog connection dict. Explicit *schemas* wins.
+        url_schemas, clean_url = _parse_schemas_from_url(connection_string)
+        self._schemas: list[str] | None = schemas or url_schemas
+        self._connection_string = clean_url
         # Pool transparently replaces connections killed by server timeouts or
         # network middleboxes. `check_connection` runs a quick liveness probe
         # before handing a connection out; `max_idle`/`max_lifetime` cap how
         # long a connection can live, so stale ones are recycled before any
         # plausible firewall idle timeout fires.
         self._pool: ConnectionPool = ConnectionPool(
-            connection_string,
+            clean_url,
             kwargs={"autocommit": True},
             min_size=1,
             max_size=4,
@@ -82,6 +113,16 @@ class PostgresDatabase(SQLDatabase):
     @property
     def database_name(self) -> str:
         return self._database_name
+
+    def _schema_clause(self, column: str) -> tuple[str, list | None]:
+        """Return ``(SQL fragment, params)`` to filter by the schema allowlist.
+
+        Uses ``= ANY(%s)`` so psycopg binds the list as a Postgres array,
+        which is sargable against the schema-name index.
+        """
+        if not self._schemas:
+            return "", None
+        return f"AND {column} = ANY(%s)", [self._schemas]
 
     # ------------------------------------------------------------------
     # Execution
@@ -146,6 +187,7 @@ class PostgresDatabase(SQLDatabase):
         view_type = TableTypes.VIEW
         materialized_view_type = TableTypes.MATERIALIZED_VIEW
         base_table_type = TableTypes.BASE_TABLE
+        _schema_cond, _schema_params = self._schema_clause("n.nspname")
         return self.execute(f"""
             SELECT
                 n.nspname   AS table_schema,
@@ -158,7 +200,7 @@ class PostgresDatabase(SQLDatabase):
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-              AND n.nspname NOT LIKE 'pg\\_%'
+              AND n.nspname !~ '^pg_'
               AND c.relispartition = false
               AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
               -- Restores what information_schema filtered for free: a relation
@@ -166,8 +208,9 @@ class PostgresDatabase(SQLDatabase):
               -- text-to-SQL will offer it and every query dies with
               -- "permission denied".
               AND has_table_privilege(c.oid, 'SELECT')
+            {_schema_cond}
             ORDER BY n.nspname, c.relname
-        """)
+        """, _schema_params)
 
     def get_columns(self) -> pd.DataFrame:
         """Columns for every relation :meth:`get_tables` returns.
@@ -194,7 +237,8 @@ class PostgresDatabase(SQLDatabase):
         catalogues, embeds and offers every table it cannot read, and every
         generated query against them dies with ``permission denied``.
         """
-        return self.execute("""
+        _schema_cond, _schema_params = self._schema_clause("n.nspname")
+        return self.execute(f"""
             SELECT
                 n.nspname                        AS table_schema,
                 c.relname                        AS table_name,
@@ -208,14 +252,15 @@ class PostgresDatabase(SQLDatabase):
             JOIN pg_class c ON c.oid = a.attrelid
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-              AND n.nspname NOT LIKE 'pg\\_%'
+              AND n.nspname !~ '^pg_'
               AND c.relispartition = false
               AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
               AND has_table_privilege(c.oid, 'SELECT')
               AND a.attnum > 0
               AND NOT a.attisdropped
+            {_schema_cond}
             ORDER BY n.nspname, c.relname, a.attnum
-        """)
+        """, _schema_params)
 
     def get_queries(self, hours: int = 24) -> pd.DataFrame:
         """Return recent queries from ``pg_stat_activity``.
@@ -243,18 +288,21 @@ class PostgresDatabase(SQLDatabase):
             return pd.DataFrame(columns=["end_time", "query_text"])
 
     def get_views(self) -> pd.DataFrame:
-        return self.execute("""
+        _schema_cond, _schema_params = self._schema_clause("v.table_schema")
+        return self.execute(f"""
             SELECT
                 v.table_schema     AS table_schema,
                 v.table_name       AS table_name,
                 v.view_definition  AS view_definition
             FROM information_schema.views v
             WHERE v.table_schema NOT IN ('pg_catalog', 'information_schema')
+            {_schema_cond}
             ORDER BY v.table_schema, v.table_name
-        """)
+        """, _schema_params)
 
     def get_pks(self) -> pd.DataFrame:
-        return self.execute("""
+        _schema_cond, _schema_params = self._schema_clause("tc.table_schema")
+        return self.execute(f"""
             SELECT
                 kcu.table_schema         AS table_schema,
                 kcu.table_name           AS table_name,
@@ -266,11 +314,13 @@ class PostgresDatabase(SQLDatabase):
              AND tc.table_schema    = kcu.table_schema
             WHERE tc.constraint_type = 'PRIMARY KEY'
               AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
+            {_schema_cond}
             ORDER BY kcu.table_schema, kcu.table_name, kcu.ordinal_position
-        """)
+        """, _schema_params)
 
     def get_fks(self) -> pd.DataFrame:
-        return self.execute("""
+        _schema_cond, _schema_params = self._schema_clause("tc.table_schema")
+        return self.execute(f"""
             SELECT
                 kcu.table_schema         AS table_schema,
                 kcu.table_name           AS table_name,
@@ -287,8 +337,9 @@ class PostgresDatabase(SQLDatabase):
              AND tc.table_schema    = ccu.table_schema
             WHERE tc.constraint_type = 'FOREIGN KEY'
               AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
+            {_schema_cond}
             ORDER BY kcu.table_schema, kcu.table_name, kcu.column_name
-        """)
+        """, _schema_params)
 
     # ------------------------------------------------------------------
     # Lifecycle
