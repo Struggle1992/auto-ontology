@@ -13,10 +13,12 @@ column so it can be used as a delete/search filter.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
 import time
+import uuid
 from typing import Any, Iterable, Optional
 
 import psycopg
@@ -346,12 +348,16 @@ class PostgresVDB:
     def write_to_index(
         self,
         records: list,
-        batch_size: int = 500,
+        batch_size: int = 5000,
         **kwargs: Any,
     ) -> int:
-        """Bulk-insert records, returning the number of rows written."""
-        documents: list[Document] = []
-        embeddings: list[list[float]] = []
+        """Bulk-insert records via COPY, returning the number of rows written.
+
+        Uses psycopg's text COPY instead of ``store.add_embeddings`` (which
+        does one INSERT + COMMIT per row, ~3 rows/s). COPY streams all rows in
+        a single transaction, achieving thousands of rows per second.
+        """
+        rows: list[tuple] = []
         skipped = 0
 
         for record in _flatten(records):
@@ -368,34 +374,57 @@ class PostgresVDB:
                 "document_type": record.get("document_type"),
                 **{k: v for k, v in metadata.items() if k != "embedding"},
             }
-            documents.append(Document(page_content=text, metadata=doc_metadata))
-            embeddings.append([float(v) for v in embedding])
 
-        if not documents:
+            # Extract typed metadata columns (matching init_vectorstore_table)
+            database_name = doc_metadata.pop("database_name", None)
+            label = doc_metadata.pop("label", None)
+
+            row_id = str(uuid.uuid4())
+            # pgvector text format: [v1,v2,...]
+            emb_str = "[" + ",".join(repr(float(v)) for v in embedding) + "]"
+            metadata_json = json.dumps(doc_metadata, default=str)
+
+            rows.append((row_id, text, emb_str, database_name, label, metadata_json))
+
+        if not rows:
             logger.info(
                 "PostgresVDB.write_to_index: no rows to insert (skipped %d)", skipped
             )
             return 0
 
-        store = self._get_store()
-        assert store is not None  # vector_size was provided
+        # Ensure the table exists (and the HNSW index is built) before COPY.
+        self._get_store()
+
+        qualified = sql.Identifier(self.schema_name, self.collection_name)
+        copy_sql = sql.SQL(
+            "COPY {} "
+            "(langchain_id, content, embedding, database_name, label, langchain_metadata) "
+            "FROM STDIN"
+        ).format(qualified)
 
         inserted = 0
-        for start in range(0, len(documents), batch_size):
-            chunk_docs = documents[start : start + batch_size]
-            chunk_embs = embeddings[start : start + batch_size]
-            store.add_embeddings(
-                texts=[d.page_content for d in chunk_docs],
-                embeddings=chunk_embs,
-                metadatas=[d.metadata for d in chunk_docs],
-            )
-            inserted += len(chunk_docs)
+        _started = time.perf_counter()
 
+        with psycopg.connect(self.connection_string) as conn:
+            with conn.cursor() as cur:
+                for start in range(0, len(rows), batch_size):
+                    chunk = rows[start : start + batch_size]
+                    with cur.copy(copy_sql) as copy:
+                        for row in chunk:
+                            copy.write_row(row)
+                    inserted += len(chunk)
+            conn.commit()
+
+        elapsed = time.perf_counter() - _started
+        rate = inserted / elapsed if elapsed > 0 else float("inf")
         logger.info(
-            "PostgresVDB.write_to_index: inserted %d rows into %s (skipped %d)",
+            "PostgresVDB.write_to_index: copied %d rows into %s "
+            "(skipped %d, %.0f rows/s, %.2fs)",
             inserted,
             self.collection_name,
             skipped,
+            rate,
+            elapsed,
         )
         return inserted
 
