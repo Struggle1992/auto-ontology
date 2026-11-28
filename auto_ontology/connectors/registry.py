@@ -166,6 +166,7 @@ def create_connector(
             SnowflakeDatabase,
             KyuubiDatabase,
             TrinoDatabase,
+            PostgresDatabase,
         ):
             connector = connector_class(connection_string, schemas=schemas)
         else:
